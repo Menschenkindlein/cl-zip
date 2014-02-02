@@ -175,7 +175,7 @@
       (let ((n (search #(80 75 5 6) v :from-end t)))
 	(unless n
 	  (error "end of central directory header not found"))
-	(file-position s (+ guess n))))))
+	(+ guess n)))))
 
 (defstruct zipfile
   stream
@@ -213,7 +213,12 @@
     (assert (= (cd/signature header) #x02014b50))
     (read-sequence name s)
     (setf name (octets-to-string name external-format))
-    (file-position s (+ (file-position s) (cd/extra-length header)))
+
+    ;;;; Should be fixed for full zip64 support
+    (read-sequence (make-array (cd/extra-length header)
+                               :element-type '(unsigned-byte 8))
+                   s)
+
     (when comment
       (read-sequence comment s)
       (setf comment (octets-to-string comment external-format)))
@@ -234,8 +239,8 @@
                   #-allegro :element-type
                   #-allegro '(unsigned-byte 8))))
     (unwind-protect
-	(progn
-	  (seek-to-end-header s)
+	(let ((end-header-position (seek-to-end-header s)))
+	  (file-position s end-header-position)
 	  (let* ((end (make-end-header s))
 		 (entries (make-hash-table :test #'equal))
 		 (zipfile (make-zipfile :stream s
@@ -244,8 +249,7 @@
                  n offset)
             (if (zip64p end)
                 (progn
-                  (file-position s (- (file-position s)
-                                      +end-header-length+
+                  (file-position s (- end-header-position
                                       +zip64-dir-locator-length+))
                   (let ((locator (make-zip64-directory-locator s)))
                     (assert (= (z64locator/signature locator) #x07064b50))
@@ -366,9 +370,15 @@
     (file-position s (zipfile-entry-offset entry))
     (setf header (make-local-header s))
     (assert (= (file/signature header) #x04034b50))
-    (file-position s (+ (file-position s)
-			(file/name-length header)
-			(file/extra-length header)))
+
+    ;; (file-position s (+ (file-position s)
+    ;;     		(file/name-length header)
+    ;;     		(file/extra-length header)))
+    (read-sequence (make-array (+ (file/name-length header)
+                                  (file/extra-length header))
+                               :element-type '(unsigned-byte 8))
+                   s)
+
     (let ((in (make-instance 'truncating-stream
                 :input-handle s
                 :size (zipfile-entry-compressed-size entry)))
