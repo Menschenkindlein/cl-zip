@@ -12,31 +12,22 @@
 (defun make-byte-array (n)
   (make-array n :element-type '(unsigned-byte 8)))
 
-(defun get-short (array offset)
-  (logior (elt array offset)
-	  (ash (elt array (1+ offset)) 8)))
+(defmacro def-integer-accessor (name bytes)
+  `(progn
+     (defun ,name (array offset)
+       (apply #'logior (elt array offset)
+              (loop for i from 1 to (1- ,bytes) collect
+                   (ash (elt array (+ offset i)) (* 8 i)))))
 
-(defun (setf get-short) (newval array offset)
-  (setf (elt array (+ offset 0)) (logand newval #xff))
-  (setf newval (ash newval -8))
-  (setf (elt array (+ offset 1)) (logand newval #xff))
-  newval)
+     (defun (setf ,name) (newval array offset)
+       (loop for i from 0 to (1- ,bytes) do
+            (setf (elt array (+ offset i)) (logand newval #xff))
+            (setf newval (ash newval -8)))
+       newval)))
 
-(defun get-int (array offset)
-  (logior (elt array offset)
-	  (ash (elt array (+ offset 1)) 8)
-	  (ash (elt array (+ offset 2)) 16)
-	  (ash (elt array (+ offset 3)) 24)))
-
-(defun (setf get-int) (newval array offset)
-  (setf (elt array (+ offset 0)) (logand newval #xff))
-  (setf newval (ash newval -8))
-  (setf (elt array (+ offset 1)) (logand newval #xff))
-  (setf newval (ash newval -8))
-  (setf (elt array (+ offset 2)) (logand newval #xff))
-  (setf newval (ash newval -8))
-  (setf (elt array (+ offset 3)) (logand newval #xff))
-  newval)
+(def-integer-accessor get-short 2)
+(def-integer-accessor get-int 4)
+(def-integer-accessor get-long 8)
 
 (defmacro define-record (constructor
 			 (&key (length #-clisp (gensym) #+clisp (gentemp)))
@@ -45,7 +36,10 @@
      (defconstant ,length
 	 ,(loop
 	      for (nil type) in fields
-	      sum (ecase type (:int 4) (:short 2))))
+	      sum (ecase type
+                    (:long 8)
+                    (:int 4)
+                    (:short 2))))
      (defun ,constructor (&optional s)
        (let ((bytes (make-byte-array ,length)))
 	 (when s
@@ -54,8 +48,14 @@
      ,@(loop
 	   for (name type) in fields
 	   for offset = 0 then (+ offset length)
-	   for length = (ecase type (:int 4) (:short 2))
-	   for reader = (ecase type (:int 'get-int) (:short 'get-short))
+	   for length = (ecase type
+                          (:long 8)
+                          (:int 4)
+                          (:short 2))
+	   for reader = (ecase type
+                          (:long 'get-long)
+                          (:int 'get-int)
+                          (:short 'get-short))
 	   unless (eq name :dummy)
 	   append `((defun ,name (r)
                       (,reader r ,offset))
@@ -108,6 +108,26 @@
   (data/crc :int)
   (data/compressed-size :int)
   (data/size :int))
+
+;; ZIP64
+
+(define-record make-zip64-directory-locator (:length +zip64-dir-locator-length+)
+  (z64locator/signature :int)
+  (z64locator/zip64-central-directory-disk :int)
+  (z64locator/offset :long)
+  (z64locator/disks-number :int))
+
+(define-record make-zip64-end-header ()
+  (z64end/signature :int)
+  (z64end/record-size :long)
+  (z64end/version-made-by :short)
+  (z64end/version-needed-to-extract :short)
+  (z64end/this-disk :int)
+  (z64end/start-disk :int)
+  (z64end/disk-files :long)
+  (z64end/total-files :long)
+  (z64end/size :long)
+  (z64end/offset :long))
 
 (defun compress (input output compressor)
   (let ((nin 0)
@@ -204,6 +224,10 @@
 			:compressed-size (cd/compressed-size header)
 			:comment comment)))
 
+(defun zip64p (end)
+  (or (= #xffff (end/total-files end))
+      (= #xffffffff (end/central-directory-offset end))))
+
 (defun open-zipfile
     (pathname &key (external-format (default-external-format)))
   (let* ((s (open pathname
@@ -213,12 +237,26 @@
 	(progn
 	  (seek-to-end-header s)
 	  (let* ((end (make-end-header s))
-		 (n (end/total-files end))
 		 (entries (make-hash-table :test #'equal))
 		 (zipfile (make-zipfile :stream s
                                         :entries entries
-                                        :external-format external-format)))
-	    (file-position s (end/central-directory-offset end))
+                                        :external-format external-format))
+                 n offset)
+            (if (zip64p end)
+                (progn
+                  (file-position s (- (file-position s)
+                                      +end-header-length+
+                                      +zip64-dir-locator-length+))
+                  (let ((locator (make-zip64-directory-locator s)))
+                    (assert (= (z64locator/signature locator) #x07064b50))
+                    (file-position s (z64locator/offset locator)))
+                  (let ((end (make-zip64-end-header s)))
+                    (assert (= (z64end/signature end) #x06064b50))
+                    (setf n (z64end/total-files end)
+                          offset (z64end/offset end))))
+                (setf n (end/total-files end)
+                      offset (end/central-directory-offset end)))
+	    (file-position s offset)
 	    (dotimes (x n)
 	      (let ((entry (read-entry-object s external-format)))
 		(setf (gethash (zipfile-entry-name entry) entries) entry)))
